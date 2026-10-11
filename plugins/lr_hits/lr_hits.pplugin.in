@@ -1,0 +1,28 @@
+{
+	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
+	"version": "${LR_HITS_VERSION}",
+	"name": "lr_hits",
+	"description": "[LR] ExStats Hits: per-player damage, armor damage and per-hitgroup hit counters in the `<lr_table>_hits` table (SteamID, DmgHealth, DmgArmor, Head, Chest, Belly, LeftArm, RightArm, LeftLeg, RightLeg, Neak), saved at disconnect or on every hit (lr_db_savedata_player_mode) and zeroed on !reset. Ported from the Pisex Levels Ranks module LR_ExStatsHits. Owns its plgdb connection with the levels_ranks database settings. Requires the levels_ranks core; no exported methods.",
+	"author": "Pisex, ported to Plugify",
+	"website": "https://github.com/untrustedmodders/plugify",
+	"license": "GPL-3.0",
+	"entry": "bin/lr_hits",
+	"platforms": [],
+	"language": "cpp",
+	"dependencies": [
+		{
+			"name": "s2sdk",
+			"constraints": ">=2.18.2"
+		},
+		{
+			"name": "levels_ranks",
+			"constraints": ">=1.0.0"
+		},
+		{
+			"name": "hudmenu",
+			"constraints": ">=1.0.0",
+			"optional": true
+		}
+	],
+	"methods": []
+}
