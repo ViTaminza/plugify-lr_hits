@@ -3,12 +3,15 @@
 //
 //   * the OnPlayerHurt counters (damage/armor, the hitgroup mapping, the all-hit sum, the flags),
 //   * the column mapping of the original,
+//   * the SteamID normalization (engine->GetPlayerNetworkIDString + ConvertSteamID of the original,
+//     now the s2sdk::GetClientAuthId post-processing),
 //   * the SQL layer: CREATE / SELECT / INSERT / the flag-driven UPDATE / reset against SQLite
 //     ":memory:" always and against MySQL when MYSQL_HOST is set (test.sh provides
 //     MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DATABASE). Rows created in MySQL are
 //     deleted at the end.
-
-#include <plg/plugin.hpp>
+//
+// The test links lr_hits_core (and transitively plgdb) only: no pisexcompat, no plugify_sdk and no
+// engine binding, so the ported core stays compilable and testable without a game server.
 
 #include <cstdint>
 #include <cstdio>
@@ -20,20 +23,6 @@
 #include <string_view>
 
 #include "hits_core.hpp"
-
-// A real plugin gets these from PLUGIFY_PLUGIN; the test leaves them null.
-namespace plg {
-GetBaseDirFn GetBaseDir{nullptr};
-GetExtensionsDirFn GetExtensionsDir{nullptr};
-GetConfigsDirFn GetConfigsDir{nullptr};
-GetDataDirFn GetDataDir{nullptr};
-GetLogsDirFn GetLogsDir{nullptr};
-GetCacheDirFn GetCacheDir{nullptr};
-IsLoadedFn IsLoaded{nullptr};
-LogFn Log{nullptr};
-BeginZoneFn BeginZone{nullptr};
-EndZoneFn EndZone{nullptr};
-} // namespace plg
 
 namespace {
 
@@ -116,18 +105,54 @@ void TestApplyHit() {
 	CHECK_EQ_INT(state.hits[kHdHitRightLeg], 1);
 	CHECK_EQ_INT(state.hits[kHdHitAll], 3);
 
+	// hitgroup 8 (neck) -> iHB 9, the "Neak" column of the shipped table.
+	ApplyHit(state, 2, 0, 8);
+	CHECK_EQ_INT(state.hits[kHdHitNeak], 1);
+	CHECK_EQ_INT(state.hits[kHdHitAll], 4);
+	CHECK_EQ_INT(state.flags & (1 << kHdHitNeak), 1 << kHdHitNeak);
+
 	// hitgroup 9 -> iHB 10: inside the original's `iHB < HitData` guard, and index 10 *is* the
 	// all-hit counter, so the original's two increments (the hitgroup one and the all-hit one)
 	// land on the same counter: +2. The flag bit 10 has no column (the original read one past
 	// sHitColumnName there; the port's SaveStatement ignores it).
 	ApplyHit(state, 1, 0, 9);
-	CHECK_EQ_INT(state.hits[kHdHitAll], 5);
+	CHECK_EQ_INT(state.hits[kHdHitAll], 6);
 	CHECK_EQ_INT(state.flags & (1 << 10), 1 << 10);
 
 	// hitgroup 10 -> iHB 11: outside the guard, dropped entirely.
 	ApplyHit(state, 1, 0, 10);
-	CHECK_EQ_INT(state.hits[kHdHitAll], 5);
+	CHECK_EQ_INT(state.hits[kHdHitAll], 6);
 	CHECK_EQ_INT(state.flags & (1 << 11), 0);
+}
+
+void TestApplyLoaded() {
+	Section("ApplyLoaded (a failed query is not an empty row)");
+	SlotState state;
+	ApplyHit(state, 30, 5, 1); // a session with one headshot already counted
+	const int damage = state.hits[kHdDmgHealth];
+	const int head = state.hits[kHdHitHead];
+	const int flags = state.flags;
+
+	// A query error (the database is down, the table is missing, a lock wait timed out): the
+	// caller retries the load, so the counters counted since the last save must survive.
+	plgdb::Result failed;
+	failed.error = "plgdb: connect failed";
+	ApplyLoaded(state, failed);
+	CHECK_EQ_INT(state.hits[kHdDmgHealth], damage);
+	CHECK_EQ_INT(state.hits[kHdHitHead], head);
+	CHECK_EQ_INT(state.hits[kHdHitAll], 1);
+	CHECK_EQ_INT(state.flags, flags);
+
+	// A successful query without a row is a new player: the counters are zeroed (the plugin then
+	// inserts the row) and the flags are cleared with them.
+	plgdb::Result missing;
+	missing.columns = {"DmgHealth", "DmgArmor", "Head", "Chest", "Belly", "LeftArm",
+					   "RightArm", "LeftLeg", "RightLeg", "Neak"};
+	ApplyLoaded(state, missing);
+	CHECK_EQ_INT(state.hits[kHdDmgHealth], 0);
+	CHECK_EQ_INT(state.hits[kHdHitHead], 0);
+	CHECK_EQ_INT(state.hits[kHdHitAll], 0);
+	CHECK_EQ_INT(state.flags, 0);
 }
 
 void TestColumnMapping() {
@@ -145,6 +170,64 @@ void TestColumnMapping() {
 	CHECK_EQ_STR(ColumnName(kHdDmgHealth), "");
 	CHECK_EQ_STR(ColumnName(99), "");
 	CHECK_EQ_STR(TableName("lvl_base"), "lvl_base_hits");
+}
+
+void TestNormalizeSteamId() {
+	Section("SteamID normalization (GetPlayerNetworkIDString + ConvertSteamID)");
+	// The "[U:1:accountid]" form the engine used to hand out: STEAM_1 = parity bit + account/2.
+	CHECK_EQ_STR(NormalizeSteamId("[U:1:123]"), "STEAM_1:1:61");
+	CHECK_EQ_STR(NormalizeSteamId("[U:1:124]"), "STEAM_1:0:62");
+	CHECK_EQ_STR(NormalizeSteamId("[U:1:46116860184329472]"), "STEAM_1:0:23058430092164736");
+	// s2sdk::GetClientAuthId already hands out the "STEAM_..." form: it is passed through, which is
+	// what keeps this module's row on the same key the levels_ranks core writes.
+	CHECK_EQ_STR(NormalizeSteamId("STEAM_1:0:62"), "STEAM_1:0:62");
+	CHECK_EQ_STR(NormalizeSteamId("STEAM_1:1:61"), "STEAM_1:1:61");
+	// Surrounding whitespace is trimmed (the LR core's own converter trims too, so both compute the
+	// same key from the same engine string).
+	CHECK_EQ_STR(NormalizeSteamId("  [U:1:123] \t"), "STEAM_1:1:61");
+	CHECK_EQ_STR(NormalizeSteamId("   "), "");
+	CHECK_EQ_STR(NormalizeSteamId(""), "");
+	// Unusable input is kept verbatim instead of crashing: the original indexed its split array
+	// past the end for a value without a third component.
+	CHECK_EQ_STR(NormalizeSteamId("BOT"), "BOT");
+	CHECK_EQ_STR(NormalizeSteamId("U:1"), "U:1");
+	CHECK_EQ_STR(NormalizeSteamId("[U:1:notanumber]"), "U:1:notanumber");
+	// The account id is parsed as 64 bit (the original's std::stoi threw for a large one).
+	CHECK_EQ_STR(NormalizeSteamId("U:1:9223372036854775806"), "STEAM_1:0:4611686018427387903");
+}
+
+void TestStatementText() {
+	Section("SQL text (CREATE / INSERT / the flag-driven UPDATE)");
+	// The CREATE TABLE of the original: the MySQL variant keeps its CHARSET/COLLATE clause, the
+	// SQLite one cannot (the columns and the primary key are the same).
+	const std::string mysql = CreateTableSql("lvl_base_hits", plgdb::Driver::MySQL);
+	CHECK(mysql.find("`SteamID` varchar(32) NOT NULL PRIMARY KEY DEFAULT ''") != std::string::npos);
+	CHECK(mysql.find("`Neak` int NOT NULL DEFAULT 0") != std::string::npos);
+	CHECK(mysql.find("CHARSET = utf8 COLLATE utf8_general_ci") != std::string::npos);
+	const std::string sqlite = CreateTableSql("lvl_base_hits", plgdb::Driver::SQLite);
+	CHECK(sqlite.find("`SteamID` TEXT NOT NULL PRIMARY KEY DEFAULT ''") != std::string::npos);
+	CHECK(sqlite.find("`Neak` INTEGER NOT NULL DEFAULT 0") != std::string::npos);
+	CHECK(sqlite.find("CHARSET") == std::string::npos);
+
+	// A player without a row gets one with every counter at its default (0).
+	const Statement insert = InsertStatement("lvl_base_hits", "STEAM_1:1:61");
+	CHECK_EQ_STR(insert.sql, "INSERT INTO `lvl_base_hits` (`SteamID`) VALUES (?);");
+	CHECK_EQ_INT(insert.params.size(), 1);
+
+	// The flag bit of hitgroup 9 (iHB 10) is set by ApplyHit but has no column (the original read
+	// one past sHitColumnName there): the UPDATE carries only DmgHealth/DmgArmor plus the WHERE.
+	SlotState all_only;
+	all_only.flags = 1 << kHdHitAll;
+	const Statement save = SaveStatement("lvl_base_hits", all_only, "STEAM_1:1:61");
+	CHECK_EQ_STR(save.sql,
+				 "UPDATE `lvl_base_hits` SET `DmgHealth` = ?, `DmgArmor` = ? WHERE `SteamID` = ?");
+	CHECK_EQ_INT(save.params.size(), 3);
+	CHECK_EQ_INT(all_only.flags, 0); // the flags were consumed like the original did
+	// Every counter at 0: UPDATE of every column, no flags involved.
+	const Statement reset = ResetStatement("lvl_base_hits", "STEAM_1:1:61");
+	CHECK_EQ_INT(reset.params.size(), 1);
+	CHECK(reset.sql.find("`DmgHealth` = 0") != std::string::npos);
+	CHECK(reset.sql.find("`Neak` = 0") != std::string::npos);
 }
 
 // --- SQL -----------------------------------------------------------------------------------------
@@ -275,7 +358,10 @@ int main() {
 	const std::string tag = std::to_string(rng() % 1000000ULL);
 
 	TestApplyHit();
+	TestApplyLoaded();
 	TestColumnMapping();
+	TestNormalizeSteamId();
+	TestStatementText();
 
 	TestDatabase(SqliteConfig(), "sqlite (:memory:)", "lvl_base_hits_sqlite", /*cleanup=*/false);
 

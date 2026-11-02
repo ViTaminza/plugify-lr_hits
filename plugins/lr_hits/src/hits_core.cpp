@@ -1,5 +1,7 @@
 #include "hits_core.hpp"
 
+#include <charconv>
+#include <cstdint>
 #include <optional>
 #include <utility>
 
@@ -13,6 +15,15 @@ constexpr int kColumnCount = static_cast<int>(sizeof(kColumnNames) / sizeof(kCol
 
 bool IsCounterColumn(int hitType) {
 	return hitType >= kHdHitHead && hitType - kHdHitHead < kColumnCount;
+}
+
+std::string_view TrimSpaces(std::string_view text) {
+	const auto begin = text.find_first_not_of(" \t\r\n");
+	if (begin == std::string_view::npos) {
+		return {};
+	}
+	const auto end = text.find_last_not_of(" \t\r\n");
+	return text.substr(begin, end - begin + 1);
 }
 
 } // namespace
@@ -38,6 +49,47 @@ void ApplyHit(SlotState& state, int dmg_health, int dmg_armor, int hitgroup) {
 
 std::string TableName(std::string_view base) {
 	return std::string(base) + "_hits";
+}
+
+std::string NormalizeSteamId(std::string_view network_id) {
+	const std::string_view trimmed = TrimSpaces(network_id);
+	if (trimmed.empty()) {
+		return {};
+	}
+	if (trimmed.rfind("STEAM_", 0) == 0) {
+		return std::string(trimmed);
+	}
+	// "[U:1:accountid]" and friends: strip the brackets, split on ':' and rebuild STEAM_1.
+	std::string stripped;
+	stripped.reserve(trimmed.size());
+	for (const char c : trimmed) {
+		if (c != '[' && c != ']') {
+			stripped.push_back(c);
+		}
+	}
+	std::string parts[3];
+	int part = 0;
+	for (const char c : stripped) {
+		if (c == ':') {
+			if (part < 2) {
+				++part;
+			}
+			continue;
+		}
+		parts[part].push_back(c);
+	}
+	if (parts[2].empty()) {
+		// The original indexed usteamid_split[2] here and crashed; the port keeps the value.
+		return stripped;
+	}
+	std::int64_t account = 0;
+	const std::string_view account_text = TrimSpaces(parts[2]);
+	const auto parsed =
+		std::from_chars(account_text.data(), account_text.data() + account_text.size(), account);
+	if (parsed.ec != std::errc{}) {
+		return stripped;
+	}
+	return "STEAM_1:" + std::string(account % 2 == 0 ? "0:" : "1:") + std::to_string(account / 2);
 }
 
 std::string CreateTableSql(std::string_view table, plgdb::Driver driver) {
@@ -91,6 +143,11 @@ Statement InsertStatement(std::string_view table, std::string_view steamid) {
 }
 
 void ApplyLoaded(SlotState& state, const plgdb::Result& result) {
+	// An error is not "no row": the slot keeps its counters and the plugin retries the load.
+	// Zeroing here would let the next save overwrite the real row with the hits counted since.
+	if (!result.Ok()) {
+		return;
+	}
 	// The callback of the original: every counter is written (a missing row leaves zeros).
 	for (int i = 0; i < kHitData; ++i) {
 		state.hits[i] = 0;
@@ -99,7 +156,7 @@ void ApplyLoaded(SlotState& state, const plgdb::Result& result) {
 	// The original rewrote the slot from the query result row (or the zeros above when the row had
 	// just been inserted).
 	const std::optional<std::size_t> column = result.ColumnIndex("DmgHealth");
-	if (!result.Ok() || result.RowCount() == 0 || !column.has_value()) {
+	if (result.RowCount() == 0 || !column.has_value()) {
 		return;
 	}
 	const std::size_t row = 0;

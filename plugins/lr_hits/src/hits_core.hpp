@@ -1,11 +1,11 @@
 #pragma once
 // Engine-free core of the lr_hits port (the Pisex LR module "[LR] ExStats Hits", the original's
 // lr_hits.cpp): the per-slot hit counters of OnPlayerHurt, the `<lr_table>_hits` table (SteamID +
-// damage/armor + one column per hitgroup) and the SQL of OnPlayerLoadedHook / OnResetLoadedHook /
-// SaveData.
+// damage/armor + one column per hitgroup), the SteamID normalization of the engine string and the
+// SQL of OnPlayerLoadedHook / OnResetLoadedHook / SaveData.
 //
-// The engine-side half (the player_hurt hook, the disconnect listener, the LR core hooks, plgdb)
-// lives in src/plugin.cpp; everything here is testable against SQLite and MySQL.
+// The engine-side half (the player_hurt hook, the map gate, the disconnect listener, the LR core
+// hooks, plgdb) lives in src/plugin.cpp; everything here is testable against SQLite and MySQL.
 
 #include <array>
 #include <cstddef>
@@ -51,6 +51,16 @@ using State = std::array<SlotState, kMaxSlots>;
 // sum and the save flag. |hitgroup| is the event's raw value (the original added 1).
 void ApplyHit(SlotState& state, int dmg_health, int dmg_armor, int hitgroup);
 
+// --- SteamID -------------------------------------------------------------------------------------
+
+// engine->GetPlayerNetworkIDString() + ConvertSteamID() of the original: CS2 reports the SteamID in
+// the "[U:1:accountid]" form and the tables of the LR suite store the "STEAM_1:x:y" one, so that
+// form is rebuilt here. A value that already is a STEAM_ id is passed through unchanged - s2sdk's
+// GetClientAuthId hands those out, and the LR core normalizes the same way, so both plugins write
+// the same `steam` value. Anything unusable is returned verbatim (the original read past the end
+// of its split array on such input and crashed) and "" stays "".
+std::string NormalizeSteamId(std::string_view network_id);
+
 // --- SQL -----------------------------------------------------------------------------------------
 // Statements are built here and executed by the plugin (async, on plgdb's worker) or by the tests
 // (QuerySync). Values are always bound parameters, never interpolated.
@@ -73,7 +83,9 @@ Statement LoadStatement(std::string_view table, std::string_view steamid);
 Statement InsertStatement(std::string_view table, std::string_view steamid);
 
 // Applies a LoadStatement result to the slot state (the callback of the original): every counter
-// zeroed, a found row copied in, and the all-hit sum rebuilt from the hitgroup counters.
+// zeroed, a found row copied in, and the all-hit sum rebuilt from the hitgroup counters. A failed
+// result (Result::Ok() false) leaves the state untouched - the caller retries the load; only a
+// successful empty result means "no row yet".
 void ApplyLoaded(SlotState& state, const plgdb::Result& result);
 
 // SaveData() of the original: an UPDATE of DmgHealth/DmgArmor plus the hitgroup columns whose flag
